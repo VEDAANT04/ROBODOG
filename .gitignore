@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# VS Code
+.vscode/
+
+# Training data
+dataset/
+
+# Trained models
+models/
+
+# Downloaded Vosk model
+vosk-model-small-en-us-0.15/
+
+# Temporary files
+tempCodeRunnerFile.py
+
+# ZIP files
+*.zip
+
+# Images (optional)
+image/
