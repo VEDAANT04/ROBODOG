@@ -9,7 +9,7 @@ import atexit
 
 import numpy as np
 import sounddevice as sd
-import pyttsx3
+from tts import say as _say
 
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
@@ -91,10 +91,6 @@ def _tts_worker():
 
     global robot_speaking
 
-    engine = pyttsx3.init()
-    engine.setProperty("rate", TTS_RATE)
-    engine.setProperty("volume", TTS_VOLUME)
-
     while True:
 
         text, done_event = _speech_queue.get()
@@ -106,8 +102,7 @@ def _tts_worker():
         print(f"ROBODOG: {text}")
 
         try:
-            engine.say(text)
-            engine.runAndWait()
+            _say(text)
         except Exception as e:
             print("TTS ERROR:", e)
         finally:
@@ -144,9 +139,10 @@ VOSK_COMMANDS = [
     "jump",
     "spin",
     "bark",
-    "hello", "hi", "hey",
+    "hello", "hi", "hey", "camera",
     "recognize me", "identify me", "who am i", "recognize face",
     "help", "commands",
+    "off", "power off",
     "[unk]",
 ]
 
@@ -187,9 +183,12 @@ COMMAND_MAP = {
 
     "bark": "bark",
 
-    "hello": "greet",
-    "hi": "greet",
-    "hey": "greet",
+    # Greetings and "camera" all trigger face recognition, which then
+    # greets the person by name if they are in the dataset.
+    "hello": "identify_person",
+    "hi": "identify_person",
+    "hey": "identify_person",
+    "camera": "identify_person",
 
     "recognize me": "identify_person",
     "identify me": "identify_person",
@@ -198,6 +197,9 @@ COMMAND_MAP = {
 
     "help": "help",
     "commands": "help",
+
+    "off": "power_off",
+    "power off": "power_off",
 }
 
 
@@ -276,7 +278,7 @@ def start_face_recognition():
                 speak(random.choice(responses))
 
             else:
-                speak("I do not recognize you yet")
+                speak("Hello. I do not recognize you yet")
 
         except Exception as e:
             print("Face recognition error:", e)
@@ -315,7 +317,8 @@ ACTION_RESPONSES = {
     "greet": "Hello. I am ready.",
     "help": (
         "You can ask me to move forward, move backward, turn left, "
-        "turn right, stop, sit, stand, jump, spin, bark, or recognize me"
+        "turn right, stop, sit, stand, jump, spin, bark, say camera to "
+        "recognize you, or say off to shut me down"
     ),
 }
 
@@ -354,6 +357,21 @@ def execute_action(intent):
 
     if response is not None:
         speak(response)
+
+
+def power_off():
+    """Say goodbye, let any movement in progress finish, crouch, and
+    return so main() can exit (atexit then releases the servos)."""
+
+    speak("Powering off. Goodbye")
+
+    if movement_lock.acquire(timeout=15):
+        try:
+            legs.rest()
+        except Exception as e:
+            print("Rest error:", e)
+        finally:
+            movement_lock.release()
 
 
 # =========================================================
@@ -522,6 +540,10 @@ def main():
                     print()
                     print(f"YOU SAID: {text}")
                     print(f"COMMAND: {intent}")
+
+                    if intent == "power_off":
+                        power_off()
+                        break
 
                     execute_action(intent)
 

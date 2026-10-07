@@ -1,0 +1,5 @@
+numpy
+sounddevice
+vosk
+pyttsx3
+opencv-contrib-python

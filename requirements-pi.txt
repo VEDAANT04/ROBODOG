@@ -1,0 +1,22 @@
+# Install these on the Raspberry Pi itself, in a plain venv - NOT conda.
+# Conda's ARM support for hardware/GPIO libraries (Blinka, RPi.GPIO) is
+# unreliable; the standard approach on Raspberry Pi OS is:
+#
+#   sudo apt-get update
+#   sudo apt-get install -y python3-venv python3-pip i2c-tools espeak
+#   sudo raspi-config   # Interface Options -> I2C -> Enable, then reboot
+#   python3 -m venv ~/robodog-env
+#   source ~/robodog-env/bin/activate
+#   pip install -r requirements-pi.txt
+#
+# After enabling I2C and rebooting, confirm the PCA9685 is visible with:
+#   i2cdetect -y 1
+# (it should show up at address 0x40 by default).
+
+vosk
+sounddevice
+numpy
+opencv-contrib-python
+pyttsx3
+adafruit-circuitpython-servokit
+RPi.GPIO
