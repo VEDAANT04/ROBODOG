@@ -5,33 +5,20 @@ import time
 import queue
 import random
 import threading
+import subprocess
+import shutil
 import atexit
 
 import numpy as np
 import sounddevice as sd
-import pyttsx3
 
 from vosk import Model, KaldiRecognizer, SetLogLevel
 
-# Face recognition is optional: if OpenCV isn't installed, the voice and
-# movement features still run and 'recognize me' just says it can't.
-try:
-    from facerecognizer import (
-        recognize_face,
-        init_camera,
-        cleanup_camera,
-    )
-except Exception as _face_import_error:
-    print(f"[face] Face recognition disabled ({_face_import_error})")
-
-    def recognize_face(*args, **kwargs):
-        return "unknown"
-
-    def init_camera():
-        return False
-
-    def cleanup_camera():
-        pass
+from facerecognizer import (
+    recognize_face,
+    init_camera,
+    cleanup_camera,
+)
 
 import legs
 
@@ -73,27 +60,164 @@ atexit.register(legs.shutdown)
 
 
 # =========================================================
-# TEXT TO SPEECH - PERSISTENT PYTTSX3 ENGINE
+# TEXT TO SPEECH
 # =========================================================
 #
-# The original implementation spawned a new PowerShell process and loaded
-# the .NET speech assembly for every single utterance, which typically
-# costs 0.5-1.5s of pure startup overhead before a single word is spoken.
-# A single long-lived pyttsx3 engine, driven from one dedicated worker
-# thread (engines are not thread-safe to call concurrently), removes that
-# cost almost entirely while keeping the same blocking speak() interface
-# the rest of the program relies on.
+# One dedicated worker thread owns the speech engine, so speak() is safe
+# to call from any thread (main loop, face-recognition thread, movement
+# thread) and utterances never overlap.
+#
+# The backend is picked per platform, because pyttsx3 in a background
+# thread can run "successfully" on Windows and produce no sound at all:
+#
+#   Windows : one long-lived PowerShell process hosting the built-in
+#             SAPI voice (System.Speech). Launched once, so there is no
+#             per-sentence startup cost.
+#   Linux/Pi: espeak-ng / espeak  (sudo apt install espeak-ng)
+#   macOS   : the built-in `say` command
+#   fallback: pyttsx3, only if none of the above is available
 
 _speech_queue = queue.Queue()
+
+
+class _WindowsSpeaker:
+
+    name = "Windows SAPI (persistent PowerShell)"
+
+    def __init__(self):
+
+        rate = max(-10, min(10, round((TTS_RATE - 175) / 15)))
+        volume = max(0, min(100, int(TTS_VOLUME * 100)))
+
+        script = (
+            "Add-Type -AssemblyName System.Speech;"
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+            "$s.Rate = " + str(rate) + ";"
+            "$s.Volume = " + str(volume) + ";"
+            "[Console]::Out.WriteLine('READY');"
+            "while (($line = [Console]::In.ReadLine()) -ne $null) {"
+            "  if ($line.Length -gt 0) { $s.Speak($line) };"
+            "  [Console]::Out.WriteLine('DONE')"
+            "}"
+        )
+
+        self.proc = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        if self.proc.stdout.readline().strip() != "READY":
+            raise RuntimeError("PowerShell speech host did not start")
+
+    def say(self, text):
+
+        clean = text.replace("\r", " ").replace("\n", " ")
+        self.proc.stdin.write(clean + "\n")
+        self.proc.stdin.flush()
+
+        # Blocks until PowerShell reports the sentence finished playing.
+        if self.proc.stdout.readline() == "":
+            raise RuntimeError("PowerShell speech host exited")
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.kill()
+
+
+class _CommandSpeaker:
+    """Runs an external TTS program once per sentence (espeak / say)."""
+
+    def __init__(self, name, build_cmd):
+        self.name = name
+        self._build_cmd = build_cmd
+
+    def say(self, text):
+        result = subprocess.run(
+            self._build_cmd(text),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "TTS command failed")
+
+    def close(self):
+        pass
+
+
+class _Pyttsx3Speaker:
+
+    name = "pyttsx3 (fallback)"
+
+    def __init__(self):
+        import pyttsx3
+        self.engine = pyttsx3.init()
+        self.engine.setProperty("rate", TTS_RATE)
+        self.engine.setProperty("volume", TTS_VOLUME)
+
+    def say(self, text):
+        self.engine.say(text)
+        self.engine.runAndWait()
+
+    def close(self):
+        pass
+
+
+def _make_speaker():
+
+    problems = []
+
+    if sys.platform.startswith("win"):
+        try:
+            return _WindowsSpeaker()
+        except Exception as e:
+            problems.append(f"Windows SAPI: {e}")
+
+    elif sys.platform == "darwin":
+        if shutil.which("say"):
+            return _CommandSpeaker(
+                "macOS say",
+                lambda t: ["say", "-r", str(TTS_RATE), t],
+            )
+
+    else:
+        exe = shutil.which("espeak-ng") or shutil.which("espeak")
+        if exe:
+            return _CommandSpeaker(
+                os.path.basename(exe),
+                lambda t: [exe, "-s", str(TTS_RATE),
+                           "-a", str(int(TTS_VOLUME * 100)), t],
+            )
+        problems.append("espeak not found (sudo apt install espeak-ng)")
+
+    try:
+        return _Pyttsx3Speaker()
+    except Exception as e:
+        problems.append(f"pyttsx3: {e}")
+
+    print("WARNING: no working text-to-speech backend - text output only.")
+    for p in problems:
+        print("   -", p)
+
+    return None
 
 
 def _tts_worker():
 
     global robot_speaking
 
-    engine = pyttsx3.init()
-    engine.setProperty("rate", TTS_RATE)
-    engine.setProperty("volume", TTS_VOLUME)
+    speaker = _make_speaker()
+
+    if speaker is not None:
+        print(f"TTS backend: {speaker.name}")
 
     while True:
 
@@ -102,18 +226,38 @@ def _tts_worker():
         if text is None:
             break
 
+        # An empty string is a "flush marker": the queue is FIFO, so by the
+        # time the worker reaches it every earlier sentence has finished.
+        if text == "":
+            if done_event is not None:
+                done_event.set()
+            continue
+
         robot_speaking = True
         print(f"ROBODOG: {text}")
 
         try:
-            engine.say(text)
-            engine.runAndWait()
+            if speaker is not None:
+                speaker.say(text)
         except Exception as e:
             print("TTS ERROR:", e)
+
+            # One restart attempt - e.g. if the PowerShell host died.
+            try:
+                if speaker is not None:
+                    speaker.close()
+                speaker = _make_speaker()
+                if speaker is not None:
+                    speaker.say(text)
+            except Exception as e2:
+                print("TTS restart failed:", e2)
         finally:
             robot_speaking = False
             if done_event is not None:
                 done_event.set()
+
+    if speaker is not None:
+        speaker.close()
 
 
 _tts_thread = threading.Thread(target=_tts_worker, daemon=True)
@@ -145,7 +289,8 @@ VOSK_COMMANDS = [
     "spin",
     "bark",
     "hello", "hi", "hey",
-    "recognize me", "identify me", "who am i", "recognize face",
+    "camera",
+    "shut down", "exit", "quit", "stop program",
     "help", "commands",
     "[unk]",
 ]
@@ -191,10 +336,12 @@ COMMAND_MAP = {
     "hi": "greet",
     "hey": "greet",
 
-    "recognize me": "identify_person",
-    "identify me": "identify_person",
-    "who am i": "identify_person",
-    "recognize face": "identify_person",
+    "camera": "identify_person",
+
+    "shut down": "shutdown",
+    "exit": "shutdown",
+    "quit": "shutdown",
+    "stop program": "shutdown",
 
     "help": "help",
     "commands": "help",
@@ -315,7 +462,8 @@ ACTION_RESPONSES = {
     "greet": "Hello. I am ready.",
     "help": (
         "You can ask me to move forward, move backward, turn left, "
-        "turn right, stop, sit, stand, jump, spin, bark, or recognize me"
+        "turn right, stop, sit, stand, jump, spin, bark, say camera to see who "
+        "I am looking at, or say shut down to turn me off"
     ),
 }
 
@@ -354,6 +502,30 @@ def execute_action(intent):
 
     if response is not None:
         speak(response)
+
+
+# =========================================================
+# GRACEFUL SHUTDOWN (voice command)
+# =========================================================
+
+def shutdown_robot():
+
+    # Let any gait that is mid-step finish, so the legs are not cut off
+    # halfway through a movement.
+    if movement_lock.acquire(timeout=10):
+        try:
+            speak("Shutting down. Goodbye", wait=False)
+            legs.rest()
+        except Exception as e:
+            print("Shutdown movement error:", e)
+        finally:
+            movement_lock.release()
+    else:
+        speak("Shutting down. Goodbye", wait=False)
+
+    # Block until the farewell has finished playing, before the speech
+    # thread is stopped in main()'s finally block.
+    speak("", wait=True)
 
 
 # =========================================================
@@ -507,6 +679,19 @@ def main():
                     if intent == "unknown":
                         continue
 
+                    # -------------------------------------
+                    # SHUTDOWN - ends main.py cleanly
+                    # -------------------------------------
+                    # Checked before the cooldown so it can't be swallowed
+                    # by a command spoken just before it. Plain "stop" still
+                    # only halts movement; it does not exit the program.
+
+                    if intent == "shutdown":
+                        print()
+                        print("COMMAND: shutdown")
+                        shutdown_robot()
+                        break
+
                     current_time = time.time()
 
                     # -------------------------------------
@@ -532,11 +717,28 @@ def main():
     finally:
         cleanup_camera()
         _speech_queue.put((None, None))
+        _tts_thread.join(timeout=3)
 
 
 # =========================================================
 # START PROGRAM
 # =========================================================
 
+def tts_test():
+    """python main.py --tts-test  ->  checks you can actually HEAR the dog."""
+
+    print("Speaking test sentences - you should hear all three.")
+    speak("Audio test one. Robodog is ready.")
+    speak("Audio test two. Moving forward.")
+    speak("Audio test three. Woof woof.")
+    print("Done. If you heard nothing, check the speaker/volume and the")
+    print("'TTS backend' / 'TTS ERROR' lines printed above.")
+    _speech_queue.put((None, None))
+    _tts_thread.join(timeout=3)
+
+
 if __name__ == "__main__":
-    main()
+    if "--tts-test" in sys.argv:
+        tts_test()
+    else:
+        main()
